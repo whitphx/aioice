@@ -937,15 +937,20 @@ class Connection:
         # connect to TURN server
         if self.turn_server:
             # create transport
-            _, protocol = await turn.create_turn_endpoint(
-                lambda: StunProtocol(self),
-                server_addr=self.turn_server,
-                username=self.turn_username,
-                password=self.turn_password,
-                ssl=self.turn_ssl,
-                transport=self.turn_transport,
-            )
-            self._protocols.append(protocol)
+            try:
+                _, protocol = await asyncio.wait_for(
+                    turn.create_turn_endpoint(
+                        lambda: StunProtocol(self),
+                        server_addr=self.turn_server,
+                        username=self.turn_username,
+                        password=self.turn_password,
+                        ssl=self.turn_ssl,
+                        transport=self.turn_transport,
+                    ),
+                    timeout=timeout,
+                )
+            except asyncio.TimeoutError:
+                return candidates
 
             # add relayed candidate
             candidate_address = protocol.transport.get_extra_info("sockname")
