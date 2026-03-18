@@ -123,7 +123,7 @@ class MessageTest(unittest.TestCase):
         self.assertEqual(
             repr(message),
             "Message(message_method=Method.BINDING, message_class=Class.REQUEST, "
-            "transaction_id=b'Nvfx3lU7FUBF')",
+            "transaction_id=4e766678336c553746554246, attributes={})",
         )
 
     def test_binding_request_ice_controlled(self) -> None:

@@ -261,7 +261,8 @@ class Message:
         return (
             f"Message(message_method=Method.{self.message_method.name}, "
             f"message_class=Class.{self.message_class.name}, "
-            f"transaction_id={repr(self.transaction_id)})"
+            f"transaction_id={self.transaction_id.hex()}, "
+            f"attributes={self.attributes})"
         )
 
 
