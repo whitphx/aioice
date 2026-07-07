@@ -675,6 +675,7 @@ class IceConnectionTest(unittest.TestCase):
         If local candidates gathering yielded no candidates, connect fails.
         """
         conn = ice.Connection(ice_controlling=True)
+        conn._local_candidates_start = True
         conn._local_candidates_end = True
         await conn.add_remote_candidate(
             Candidate.from_sdp(

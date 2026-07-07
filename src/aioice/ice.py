@@ -9,8 +9,8 @@ import re
 import secrets
 import socket
 import threading
-from collections.abc import Callable
-from typing import Optional, Union, cast
+from collections.abc import Callable, Coroutine
+from typing import Any, Optional, Union, cast
 
 import ifaddr
 
@@ -25,6 +25,13 @@ ICE_FAILED = 2
 
 CONSENT_FAILURES = 6
 CONSENT_INTERVAL = 5
+
+# When all candidate pairs have failed but more candidates may still be
+# provided, wait this long for new candidates before declaring failure.
+#
+# See RFC 8863, which recommends a value equal to the agent's STUN
+# transaction timeout.
+PAC_TIMEOUT = 39.5
 
 connection_id = itertools.count()
 protocol_id = itertools.count()
@@ -360,6 +367,9 @@ class Connection:
                            will be generated.
     :param local_password: An optional local password, otherwise a random one
                            will be generated.
+    :param on_local_candidate: An optional callback which is invoked with each
+                               local candidate as it is gathered, allowing it
+                               to be trickled to the remote party.
     """
 
     def __init__(
@@ -377,6 +387,7 @@ class Connection:
         transport_policy: TransportPolicy = TransportPolicy.ALL,
         local_username: Optional[str] = None,
         local_password: Optional[str] = None,
+        on_local_candidate: Optional[Callable[[Candidate], None]] = None,
     ) -> None:
         self.ice_controlling = ice_controlling
 
@@ -396,6 +407,9 @@ class Connection:
         self.remote_username: Optional[str] = None
         #: Remote password, which you need to set.
         self.remote_password: Optional[str] = None
+        #: An optional callback which is invoked with each local candidate as
+        #: it is gathered by :meth:`gather_candidates`.
+        self.on_local_candidate = on_local_candidate
 
         self.stun_server = stun_server
         self.turn_server = turn_server
@@ -423,6 +437,8 @@ class Connection:
         self._local_username = local_username
         self._nominated: dict[int, CandidatePair] = {}
         self._nominating: set[int] = set()
+        self._pac_expired = False
+        self._pac_handle: Optional[asyncio.TimerHandle] = None
         self._protocols: list[StunProtocol] = []
         self._remote_candidates: list[Candidate] = []
         self._remote_candidates_end = False
@@ -489,6 +505,7 @@ class Connection:
         if remote_candidate is None:
             self._prune_components()
             self._remote_candidates_end = True
+            self._maybe_fail_check_list()
             return
 
         # resolve mDNS candidate
@@ -532,9 +549,12 @@ class Connection:
         """
         Gather local candidates.
 
-        You **must** call this coroutine before calling :meth:`connect`.
+        You **must** start this coroutine before calling :meth:`connect`, but
+        you do not need to await its completion first: candidates are usable
+        as soon as they are discovered, and each one is passed to the
+        `on_local_candidate` callback if one is set.
         """
-        if not self._local_candidates_start:
+        if not self._local_candidates_start and not self._closed:
             self._local_candidates_start = True
             addresses = get_host_addresses(
                 use_ipv4=self._use_ipv4, use_ipv6=self._use_ipv6
@@ -543,9 +563,19 @@ class Connection:
                 self.get_component_candidates(component=component, addresses=addresses)
                 for component in self._components
             ]
-            for candidates in await asyncio.gather(*coros):
-                self._local_candidates += candidates
+            try:
+                await asyncio.gather(*coros)
+            finally:
+                if self._closed:
+                    # The connection was closed while gathering was still in
+                    # progress: close any protocol which was created after
+                    # close() released the others.
+                    for protocol in self._protocols:
+                        await protocol.close()
+                    self._protocols.clear()
+                    self._local_candidates.clear()
             self._local_candidates_end = True
+            self._maybe_fail_check_list()
 
     def get_default_candidate(self, component: int) -> Optional[Candidate]:
         """
@@ -564,8 +594,12 @@ class Connection:
 
         This coroutine returns if a candidate pair was successfuly nominated
         and raises an exception otherwise.
+
+        Local candidates gathering must have been started with
+        :meth:`gather_candidates`, but does not need to have completed:
+        candidates discovered while connecting are used as they appear.
         """
-        if not self._local_candidates_end:
+        if not self._local_candidates_start:
             raise ConnectionError("Local candidates gathering was not performed")
 
         if self.remote_username is None or self.remote_password is None:
@@ -588,6 +622,17 @@ class Connection:
             self.check_incoming(*early_check)
         self._early_checks = []
         self._early_checks_done = True
+
+        # While either party may still provide candidates, failure is not
+        # declared when the check list empties out. Bound that wait with the
+        # PAC timer (RFC 8863), as the remote party may never signal
+        # end-of-candidates.
+        if (
+            not self._remote_candidates_end or not self._local_candidates_end
+        ) and self._pac_handle is None:
+            self._pac_handle = asyncio.get_event_loop().call_later(
+                PAC_TIMEOUT, self._on_pac_timeout
+            )
 
         # perform checks
         while True:
@@ -623,6 +668,9 @@ class Connection:
                 await self._query_consent_task
             except asyncio.CancelledError:
                 pass
+
+        # stop the PAC timer
+        self._cancel_pac_timer()
 
         # stop check list
         if self._check_list and not self._check_list_done:
@@ -740,6 +788,32 @@ class Connection:
 
     # private
 
+    def _add_local_candidate(self, candidate: Candidate) -> None:
+        """
+        Add a gathered local candidate and announce it.
+        """
+        self._local_candidates.append(candidate)
+        if self.on_local_candidate is not None:
+            # A misbehaving callback must not abort candidate gathering.
+            try:
+                self.on_local_candidate(candidate)
+            except Exception:
+                logger.exception("The on_local_candidate callback raised an exception")
+
+    def _add_protocol(self, protocol: StunProtocol) -> None:
+        """
+        Add a protocol and pair its local candidate with remote candidates.
+        """
+        self._protocols.append(protocol)
+
+        for remote_candidate in self._remote_candidates:
+            if protocol.local_candidate.can_pair_with(
+                remote_candidate
+            ) and not self._find_pair(protocol, remote_candidate):
+                pair = CandidatePair(protocol, remote_candidate)
+                self._check_list.append(pair)
+        self.sort_check_list()
+
     def build_request(self, pair: CandidatePair, nominate: bool) -> stun.Message:
         tx_username = "%s:%s" % (self.remote_username, self.local_username)
         request = stun.Message(
@@ -782,6 +856,7 @@ class Connection:
                     self.__log_info("ICE completed")
                     self._check_list_state.put_nowait(ICE_COMPLETED)
                     self._check_list_done = True
+                    self._cancel_pac_timer()
                 return
 
             # 7.1.3.2.3.  Updating Pair States
@@ -792,22 +867,7 @@ class Connection:
                 ):
                     self.check_state(p, CandidatePair.State.WAITING)
 
-        for p in self._check_list:
-            if p.state not in [
-                CandidatePair.State.SUCCEEDED,
-                CandidatePair.State.FAILED,
-            ]:
-                return
-
-        if not self.ice_controlling:
-            for p in self._check_list:
-                if p.state == CandidatePair.State.SUCCEEDED:
-                    return
-
-        if not self._check_list_done:
-            self.__log_info("ICE failed")
-            self._check_list_state.put_nowait(ICE_FAILED)
-            self._check_list_done = True
+        self._maybe_fail_check_list()
 
     def check_incoming(
         self, message: stun.Message, addr: tuple[str, int], protocol: StunProtocol
@@ -872,7 +932,7 @@ class Connection:
                 return True
 
         # if we expect more candidates, keep going
-        if not self._remote_candidates_end:
+        if not self._remote_candidates_end or not self._local_candidates_end:
             return not self._check_list_done
 
         return False
@@ -971,8 +1031,7 @@ class Connection:
 
     async def get_component_candidates(
         self, component: int, addresses: list[str], timeout: int = 5
-    ) -> list[Candidate]:
-        candidates = []
+    ) -> None:
         loop = asyncio.get_event_loop()
 
         # gather host candidates
@@ -1004,11 +1063,25 @@ class Connection:
                 port=candidate_address[1],
                 type="host",
             )
+            self._add_protocol(protocol)
             if self._transport_policy == TransportPolicy.ALL:
-                candidates.append(protocol.local_candidate)
-        self._protocols += host_protocols
+                self._add_local_candidate(protocol.local_candidate)
 
-        tasks: list[asyncio.Task[tuple[Candidate, Optional[StunProtocol]]]] = []
+        # Announce each candidate as soon as its query completes, so that it
+        # can be trickled to the remote party. A failed query is silently
+        # discarded: it just means that candidate type is unavailable.
+        async def announce(
+            coro: Coroutine[Any, Any, tuple[Candidate, Optional[StunProtocol]]],
+        ) -> None:
+            try:
+                candidate, protocol = await coro
+            except Exception:
+                return
+            if protocol is not None:
+                self._add_protocol(protocol)
+            self._add_local_candidate(candidate)
+
+        tasks: list[asyncio.Task[None]] = []
 
         # Query STUN server for server-reflexive candidates (IPv4 only).
         if self.stun_server:
@@ -1016,7 +1089,9 @@ class Connection:
                 if ipaddress.ip_address(protocol.local_candidate.host).version == 4:
                     tasks.append(
                         asyncio.create_task(
-                            server_reflexive_candidate(protocol, self.stun_server)
+                            announce(
+                                server_reflexive_candidate(protocol, self.stun_server)
+                            )
                         )
                     )
 
@@ -1024,31 +1099,81 @@ class Connection:
         if self.turn_server:
             tasks.append(
                 asyncio.create_task(
-                    relayed_candidate(
-                        component=component,
-                        protocol_factory=lambda: StunProtocol(self),
-                        turn_server=self.turn_server,
-                        turn_username=self.turn_username,
-                        turn_password=self.turn_password,
-                        turn_ssl=self.turn_ssl,
-                        turn_transport=self.turn_transport,
+                    announce(
+                        relayed_candidate(
+                            component=component,
+                            protocol_factory=lambda: StunProtocol(self),
+                            turn_server=self.turn_server,
+                            turn_username=self.turn_username,
+                            turn_password=self.turn_password,
+                            turn_ssl=self.turn_ssl,
+                            turn_transport=self.turn_transport,
+                        )
                     )
                 )
             )
 
-        # Run tasks in parallel and handle exceptions.
+        # Wait for the queries to complete.
         if len(tasks):
-            done, pending = await asyncio.wait(tasks, timeout=timeout)
-            for task in done:
-                if task.exception() is None:
-                    candidate, protocol = task.result()
-                    candidates.append(candidate)
-                    if protocol is not None:
-                        self._protocols.append(protocol)
+            try:
+                _, pending = await asyncio.wait(tasks, timeout=timeout)
+            except asyncio.CancelledError:
+                # gathering itself was cancelled, e.g. the connection is
+                # being closed while candidates are still being gathered
+                for task in tasks:
+                    task.cancel()
+                raise
             for task in pending:
                 task.cancel()
 
-        return candidates
+    def _cancel_pac_timer(self) -> None:
+        if self._pac_handle is not None:
+            self._pac_handle.cancel()
+            self._pac_handle = None
+
+    def _maybe_fail_check_list(self) -> None:
+        """
+        Declare ICE failure if the check list is exhausted.
+        """
+        if self._check_list_done or self._closed:
+            return
+
+        # as long as any pair is pending, the outcome is undecided
+        for p in self._check_list:
+            if p.state not in [
+                CandidatePair.State.SUCCEEDED,
+                CandidatePair.State.FAILED,
+            ]:
+                return
+
+        # a controlled agent with a successful pair waits for the
+        # controlling agent to nominate it
+        if not self.ice_controlling:
+            for p in self._check_list:
+                if p.state == CandidatePair.State.SUCCEEDED:
+                    return
+
+        if not self._pac_expired:
+            # While either party may still provide candidates, new pairs may
+            # yet be formed, so defer failure until the PAC timer armed by
+            # connect() expires.
+            if not self._remote_candidates_end or not self._local_candidates_end:
+                return
+
+            # An empty check list with end-of-candidates on both sides is
+            # handled by connect() itself.
+            if not self._check_list:
+                return
+
+        self.__log_info("ICE failed")
+        self._check_list_state.put_nowait(ICE_FAILED)
+        self._check_list_done = True
+        self._cancel_pac_timer()
+
+    def _on_pac_timeout(self) -> None:
+        self._pac_handle = None
+        self._pac_expired = True
+        self._maybe_fail_check_list()
 
     def _prune_components(self) -> None:
         """
@@ -1141,7 +1266,15 @@ class Connection:
         response.add_message_integrity(self.local_password.encode("utf8"))
         protocol.send_stun(response, addr)
 
-        if not self._check_list and not self._early_checks_done:
+        # A triggered check cannot be performed until the remote credentials
+        # are known, so queue early checks until then. With trickle ICE,
+        # checks from the remote party may arrive well before the answer
+        # carrying the credentials has been processed.
+        if not self._early_checks_done and (
+            self.remote_username is None
+            or self.remote_password is None
+            or not self._check_list
+        ):
             self._early_checks.append((message, addr, protocol))
         else:
             self.check_incoming(message, addr, protocol)

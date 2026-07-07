@@ -3,6 +3,31 @@ Changelog
 
 .. currentmodule:: aioice
 
+0.11.0
+------
+
+ * Add support for full Trickle ICE (RFC 8838):
+
+   - Local candidates are gathered incrementally: they appear in
+     :attr:`Connection.local_candidates` and are passed to the new
+     `on_local_candidate` callback as they are discovered.
+   - :meth:`Connection.connect` may be called as soon as
+     :meth:`Connection.gather_candidates` has started, without waiting
+     for it to complete.
+
+ * Do not declare ICE failure while either party may still provide
+   candidates. Instead, once the check list is exhausted, wait for the
+   PAC timer (RFC 8863) to expire. Note that callers which provide remote
+   candidates but never signal end-of-candidates will now see
+   :meth:`Connection.connect` fail after this timeout (roughly 40 seconds)
+   instead of failing as soon as all known candidate pairs have failed.
+
+ * Queue incoming connectivity checks until the remote credentials are
+   known, instead of attempting a triggered check without them.
+
+ * Close pending sockets and TURN allocations when the connection is
+   closed while candidate gathering is still in progress.
+
 0.10.2
 ------
 
