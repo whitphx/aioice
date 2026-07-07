@@ -606,14 +606,8 @@ class Connection:
             raise ConnectionError("Remote username or password is missing")
 
         # 5.7.1. Forming Candidate Pairs
-        for remote_candidate in self._remote_candidates:
-            for protocol in self._protocols:
-                if protocol.local_candidate.can_pair_with(
-                    remote_candidate
-                ) and not self._find_pair(protocol, remote_candidate):
-                    pair = CandidatePair(protocol, remote_candidate)
-                    self._check_list.append(pair)
-        self.sort_check_list()
+        for protocol in self._protocols:
+            self._pair_protocol(protocol)
 
         self._unfreeze_initial()
 
@@ -805,7 +799,13 @@ class Connection:
         Add a protocol and pair its local candidate with remote candidates.
         """
         self._protocols.append(protocol)
+        self._pair_protocol(protocol)
 
+    def _pair_protocol(self, protocol: StunProtocol) -> None:
+        """
+        Form candidate pairs between a protocol's local candidate and the
+        known remote candidates.
+        """
         for remote_candidate in self._remote_candidates:
             if protocol.local_candidate.can_pair_with(
                 remote_candidate
